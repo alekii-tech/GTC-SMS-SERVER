@@ -1,141 +1,158 @@
-// GTC TRACKING - SMS Relay Server
-// Deploy this to Render.com for free automatic SMS sending
-
 const express = require('express');
 const cors    = require('cors');
-const AfricasTalking = require('africastalking');
+const https   = require('https');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- CORS: allow your Netlify domain (and localhost for testing) ----
-app.use(cors({
-  origin: [
-    'https://*.netlify.app',  // all netlify apps
-    'https://*.netlify.com',
-    'http://localhost',
-    'http://127.0.0.1',
-    'null',                   // local HTML file
-    '*'                       // fallback — restrict to your domain in production
-  ],
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Secret']
-}));
-
+app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
-// ---- Simple API secret to protect your server ----
-// Set GTC_API_SECRET as an environment variable on Render
-const API_SECRET = process.env.GTC_API_SECRET || 'gtc-secret-2024';
+// POST directly to Africa's Talking bulk SMS endpoint
+function postToAT(apiKey, username, to, message, from, sandbox) {
+  return new Promise(function(resolve, reject) {
+    var host = sandbox
+      ? 'api.sandbox.africastalking.com'
+      : 'api.africastalking.com';
 
-function checkSecret(req, res) {
-  const secret = req.headers['x-api-secret'] || req.body.apiSecret;
-  if (secret !== API_SECRET) {
-    res.status(401).json({ error: 'Unauthorized' });
-    return false;
-  }
-  return true;
+    var bodyObj = {
+      username:    username,
+      to:          to,
+      message:     message,
+      bulkSMSMode: 1
+    };
+    if (from) bodyObj.from = from;
+
+    var body = JSON.stringify(bodyObj);
+
+    console.log('POST to: https://' + host + '/version1/messaging/bulk');
+    console.log('To:', to, '| Username:', username);
+
+    var options = {
+      hostname: host,
+      port:     443,
+      path:     '/version1/messaging/bulk',
+      method:   'POST',
+      headers: {
+        'Accept':         'application/json',
+        'Content-Type':   'application/json',
+        'apiKey':          apiKey,
+        'Content-Length':  Buffer.byteLength(body)
+      }
+    };
+
+    var req = https.request(options, function(resp) {
+      var data = '';
+      resp.on('data', function(d) { data += d; });
+      resp.on('end', function() {
+        console.log('AT status:', resp.statusCode, '| Response:', data);
+        try { resolve({ status: resp.statusCode, body: JSON.parse(data) }); }
+        catch(e) { resolve({ status: resp.statusCode, body: data }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }
 
-// ---- Health check ----
-app.get('/', (req, res) => {
-  res.json({
-    status: 'GTC SMS Relay Server is running',
-    version: '1.0.0',
-    endpoints: ['/send-sms', '/send-bulk', '/test']
-  });
+// Health check
+app.get('/',     function(req, res) { res.json({ status: 'GTC SMS Relay running', version: '5.0.0' }); });
+app.get('/test', function(req, res) { res.json({ ok: true, message: 'Server reachable' }); });
+
+// Send bulk SMS — no auth check, just forwards straight to AT
+app.post('/send-bulk', async function(req, res) {
+  var username = req.body.username;
+  var apiKey   = req.body.apiKey;
+  var messages = req.body.messages;
+  var from     = req.body.from     || null;
+  var sandbox  = req.body.sandbox  || false;
+
+  if (!username || !apiKey) return res.status(400).json({ error: 'Missing AT username or apiKey' });
+  if (!messages || !messages.length) return res.status(400).json({ error: 'No messages provided' });
+
+  console.log('Bulk send: ' + messages.length + ' messages | Sandbox=' + sandbox);
+
+  var successCount = 0;
+  var failCount    = 0;
+  var results      = [];
+
+  for (var i = 0; i < messages.length; i++) {
+    var item = messages[i];
+    try {
+      var resp       = await postToAT(apiKey, username, item.to, item.message, from, sandbox);
+      var recipients = resp.body && resp.body.SMSMessageData
+                       ? resp.body.SMSMessageData.Recipients : [];
+      var r          = recipients[0];
+      var ok         = r && r.status === 'Success';
+
+      if (ok) successCount++; else failCount++;
+      results.push({ to: item.to, name: item.name || '', status: ok ? 'sent' : 'failed', detail: r ? r.status : JSON.stringify(resp.body) });
+      console.log((ok ? 'SENT' : 'FAIL') + ': ' + item.to);
+    } catch(e) {
+      failCount++;
+      results.push({ to: item.to, name: item.name || '', status: 'error', error: e.message });
+      console.error('Error ' + item.to + ':', e.message);
+    }
+  }
+
+  res.json({ ok: true, total: messages.length, success: successCount, failed: failCount, results: results });
 });
 
-app.get('/test', (req, res) => {
-  res.json({ ok: true, message: 'Server reachable' });
-});
-
-// ---- Send single SMS ----
-app.post('/send-sms', async (req, res) => {
-  if (!checkSecret(req, res)) return;
-
-  const { username, apiKey, to, message, from } = req.body;
+// Send single SMS — for test button
+app.post('/send-sms', async function(req, res) {
+  var username = req.body.username;
+  var apiKey   = req.body.apiKey;
+  var to       = req.body.to;
+  var message  = req.body.message;
+  var from     = req.body.from    || null;
+  var sandbox  = req.body.sandbox || false;
 
   if (!username || !apiKey || !to || !message) {
-    return res.status(400).json({ error: 'Missing required fields: username, apiKey, to, message' });
+    return res.status(400).json({ error: 'Missing: username, apiKey, to, message' });
   }
 
   try {
-    const AT = AfricasTalking({ username, apiKey });
-    const sms = AT.SMS;
-
-    const result = await sms.send({
-      to: Array.isArray(to) ? to : [to],
-      message,
-      from: from || undefined
-    });
-
-    const recipients = result.SMSMessageData.Recipients;
-    const success = recipients.filter(r => r.status === 'Success').length;
-    const failed  = recipients.filter(r => r.status !== 'Success').length;
-
-    res.json({
-      ok: true,
-      total: recipients.length,
-      success,
-      failed,
-      recipients,
-      cost: result.SMSMessageData.Message
-    });
-  } catch (err) {
-    console.error('SMS error:', err.message);
+    var resp       = await postToAT(apiKey, username, to, message, from, sandbox);
+    var recipients = resp.body && resp.body.SMSMessageData
+                     ? resp.body.SMSMessageData.Recipients : [];
+    var success    = recipients.filter(function(r){ return r.status === 'Success'; }).length;
+    var failed     = recipients.filter(function(r){ return r.status !== 'Success'; }).length;
+    res.json({ ok: true, total: recipients.length, success: success, failed: failed, recipients: recipients });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---- Send bulk SMS to multiple members at once ----
-app.post('/send-bulk', async (req, res) => {
-  if (!checkSecret(req, res)) return;
+// Check AT balance
+app.post('/at-balance', async function(req, res) {
+  var username = req.body.username;
+  var apiKey   = req.body.apiKey;
+  var sandbox  = req.body.sandbox || false;
+  var host     = sandbox ? 'api.sandbox.africastalking.com' : 'api.africastalking.com';
 
-  const { username, apiKey, messages, from } = req.body;
-  // messages = array of { to: '+254...', message: '...' }
+  var options = {
+    hostname: host,
+    path:     '/version1/user?username=' + username,
+    method:   'GET',
+    headers:  { 'Accept': 'application/json', 'apiKey': apiKey }
+  };
 
-  if (!username || !apiKey || !messages || !messages.length) {
-    return res.status(400).json({ error: 'Missing: username, apiKey, messages[]' });
-  }
-
-  const AT = AfricasTalking({ username, apiKey });
-  const sms = AT.SMS;
-
-  const results = [];
-  let successCount = 0;
-  let failCount = 0;
-
-  // Send all in parallel for speed
-  const promises = messages.map(async (item) => {
-    try {
-      const result = await sms.send({
-        to: [item.to],
-        message: item.message,
-        from: from || undefined
-      });
-      const r = result.SMSMessageData.Recipients[0];
-      const ok = r && r.status === 'Success';
-      if (ok) successCount++; else failCount++;
-      return { to: item.to, name: item.name, status: ok ? 'sent' : 'failed', detail: r };
-    } catch (e) {
-      failCount++;
-      return { to: item.to, name: item.name, status: 'error', error: e.message };
-    }
+  var request = https.request(options, function(resp) {
+    var data = '';
+    resp.on('data', function(d) { data += d; });
+    resp.on('end', function() {
+      try {
+        var parsed  = JSON.parse(data);
+        var balance = parsed.UserData ? parsed.UserData.balance : null;
+        balance ? res.json({ ok: true, balance: balance }) : res.json({ ok: false, error: data });
+      } catch(e) { res.status(500).json({ error: data }); }
+    });
   });
-
-  const settled = await Promise.allSettled(promises);
-  settled.forEach(r => results.push(r.value || r.reason));
-
-  res.json({
-    ok: true,
-    total: messages.length,
-    success: successCount,
-    failed: failCount,
-    results
-  });
+  request.on('error', function(e) { res.status(500).json({ error: e.message }); });
+  request.end();
 });
 
-app.listen(PORT, () => {
-  console.log('GTC SMS Relay running on port ' + PORT);
+app.listen(PORT, function() {
+  console.log('GTC SMS Relay v5.0 on port ' + PORT);
 });
